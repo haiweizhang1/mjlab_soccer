@@ -22,6 +22,9 @@ from mjlab.tasks.velocity_football_depth import (
   DEPTH_KLAVIER_LEGACY512_NOISE0_STAGE1_TASK_ID,
   DEPTH_KLAVIER_LEGACY_REWARDS_ACTION_ONLY_STAGE1_TASK_ID,
   DEPTH_KLAVIER_LEGACY_REWARDS_STAGE2_TASK_ID,
+  DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_ACTION_ONLY_STAGE1_TASK_ID,
+  DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_STAGE1_TASK_ID,
+  DEPTH_KLAVIER_MOTOR_PD_STAGE3_TASK_ID,
   DEPTH_KLAVIER_STAGE1_TASK_ID,
   DEPTH_KLAVIER_STAGE2_TASK_ID,
   DEPTH_KLAVIER_VISIBILITY_STAGE2_TASK_ID,
@@ -61,6 +64,9 @@ def test_only_expected_depth_football_tasks_are_registered() -> None:
     DEPTH_KLAVIER_LEGACY512_NOISE0_ACTION_ONLY_STAGE1_TASK_ID,
     DEPTH_KLAVIER_LEGACY_REWARDS_ACTION_ONLY_STAGE1_TASK_ID,
     DEPTH_KLAVIER_LEGACY_REWARDS_STAGE2_TASK_ID,
+    DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_STAGE1_TASK_ID,
+    DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_ACTION_ONLY_STAGE1_TASK_ID,
+    DEPTH_KLAVIER_MOTOR_PD_STAGE3_TASK_ID,
   }
 
 
@@ -82,6 +88,9 @@ def test_only_expected_depth_football_tasks_are_registered() -> None:
     DEPTH_KLAVIER_LEGACY512_NOISE0_ACTION_ONLY_STAGE1_TASK_ID,
     DEPTH_KLAVIER_LEGACY_REWARDS_ACTION_ONLY_STAGE1_TASK_ID,
     DEPTH_KLAVIER_LEGACY_REWARDS_STAGE2_TASK_ID,
+    DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_STAGE1_TASK_ID,
+    DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_ACTION_ONLY_STAGE1_TASK_ID,
+    DEPTH_KLAVIER_MOTOR_PD_STAGE3_TASK_ID,
   ),
 )
 def test_active_depth_tasks_expose_temporal_teacher_contract(task_id: str) -> None:
@@ -213,6 +222,55 @@ def test_legacy512_noise0_action_only_stage_one_depth_contract() -> None:
   assert runner_cfg.algorithm.symmetry_cfg is None
   assert runner_cfg.max_iterations == 10_000
   assert runner_cfg.save_interval == 1_000
+
+
+@pytest.mark.parametrize(
+  ("task_id", "algorithm_suffix", "has_latent_loss"),
+  (
+    (
+      DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_STAGE1_TASK_ID,
+      "FrozenLatentDistillation",
+      True,
+    ),
+    (
+      DEPTH_KLAVIER_MOTOR_PD_LONG_DROPOUT_ACTION_ONLY_STAGE1_TASK_ID,
+      "TeacherRolloutDistillation",
+      False,
+    ),
+  ),
+)
+def test_motor_pd_long_dropout_teacher_stage_one_depth_contract(
+  task_id: str,
+  algorithm_suffix: str,
+  has_latent_loss: bool,
+) -> None:
+  cfg = load_env_cfg(task_id)
+  runner_cfg = cast(Any, load_rl_cfg(task_id))
+  ball = cfg.observations["actor_history"].terms["ball_features_b"]
+  depth = cfg.observations["depth"].terms["image"]
+  actuators = cfg.scene.entities["robot"].articulation.actuators
+
+  assert all(type(actuator).__name__ == "IdealPdActuatorCfg" for actuator in actuators)
+  assert {
+    "encoder_bias",
+    "base_mass",
+    "joint_default_pos",
+    "joint_friction",
+    "joint_armature",
+    "actuator_gains",
+  }.issubset(cfg.events)
+  assert cfg.rewards["command_velocity_envelope"].weight == pytest.approx(-1.0)
+  assert cfg.rewards["action_acc_l2"].weight == pytest.approx(-0.1)
+  assert ball.params["transition_dropout_probability"] == pytest.approx(0.0)
+  assert (ball.delay_min_lag, ball.delay_max_lag) == (0, 0)
+  assert (depth.delay_min_lag, depth.delay_max_lag) == (0, 0)
+  assert runner_cfg.teacher.hidden_dims == (512, 256, 128)
+  assert runner_cfg.student.hidden_dims == (512, 256, 128)
+  assert runner_cfg.student.cnn_cfg["freeze_coordinate_actor"] is True
+  assert runner_cfg.algorithm.class_name.endswith(algorithm_suffix)
+  assert hasattr(runner_cfg.algorithm, "latent_loss_coef") is has_latent_loss
+  if has_latent_loss:
+    assert runner_cfg.algorithm.latent_loss_coef == pytest.approx(0.1)
 
 
 def test_legacy_rewards_action_only_stage_one_depth_contract() -> None:

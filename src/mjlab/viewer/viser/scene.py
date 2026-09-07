@@ -439,7 +439,13 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
   @override
   def _create_mesh_handles_by_group(self) -> None:
     """Create dynamic mesh handles, respecting per-world mesh variants."""
-    if not self._use_per_world_mesh_groups:
+    # mjviser 0.0.14 leaves ``geom_group`` as a NumPy scalar. For groups >= 6,
+    # its visibility expression returns ``np.bool_``, which viser cannot encode
+    # when replaying persistent messages to a newly connected client. Use the
+    # local path below, which normalizes group ids and visibility to Python
+    # scalars, whenever those hidden collision groups are present.
+    has_extended_geom_groups = bool(np.any(self.mj_model.geom_group >= 6))
+    if not self._use_per_world_mesh_groups and not has_extended_geom_groups:
       super()._create_mesh_handles_by_group()
       return
 
@@ -490,7 +496,9 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
         batch_count = len(variant.env_ids)
         lod_ratio = 1000.0 / variant.mesh.vertices.shape[0]
         suffix = f"/sub{variant.sub_idx}" if variant.sub_idx > 0 else ""
-        visible = variant.group_id < 6 and self.geom_groups_visible[variant.group_id]
+        visible = bool(
+          variant.group_id < 6 and self.geom_groups_visible[variant.group_id]
+        )
 
         handle = self.server.scene.add_batched_meshes_trimesh(
           f"/bodies/{variant.body_name}/group{variant.group_id}"

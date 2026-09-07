@@ -9,6 +9,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import CameraSensorCfg
 from mjlab.tasks.velocity_football.config.g1.env_cfgs import (
@@ -18,6 +19,7 @@ from mjlab.tasks.velocity_football.config.g1.env_cfgs import (
   unitree_g1_long_dropout10_envelope30_legacy_curriculum_flat_env_cfg,
 )
 from mjlab.tasks.velocity_football.mdp.observations import ball_pos_b
+from mjlab.tasks.velocity_football.mdp.rewards import command_velocity_envelope_l2
 
 from .events import (
   randomize_camera_between_calibrations,
@@ -684,6 +686,58 @@ def unitree_g1_depth_klavier_legacy512_noise0_stage1_flat_env_cfg(
   return cfg
 
 
+def unitree_g1_depth_klavier_motor_pd_long_dropout_teacher_stage1_flat_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Stage 1 matched to the MotorPD LongDropout10 Legacy512 Teacher plant.
+
+  Synthetic coordinate dropout stays disabled during distillation: hiding the
+  Teacher coordinates while the ball remains visible in depth would provide a
+  contradictory target. The Teacher's learned dropout robustness is retained
+  in its frozen checkpoint.
+  """
+  from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+    get_g1_klavier_robot_cfg_ideal_pd,
+  )
+
+  cfg = unitree_g1_depth_klavier_legacy512_noise0_stage1_flat_env_cfg(play=play)
+  cfg.scene.entities["robot"] = get_g1_klavier_robot_cfg_ideal_pd()
+  cfg.rewards["command_velocity_envelope"] = RewardTermCfg(
+    func=command_velocity_envelope_l2,
+    weight=-1.0,
+    params={
+      "command_name": "twist",
+      "min_tolerance_x": 0.10,
+      "min_tolerance_y": 0.10,
+      "min_tolerance_yaw": 0.15,
+      "relative_tolerance": 0.30,
+    },
+  )
+  cfg.rewards["action_acc_l2"] = RewardTermCfg(
+    func=envs_mdp.action_acc_l2,
+    weight=-0.1,
+  )
+  return cfg
+
+
+def unitree_g1_depth_klavier_motor_pd_legacy_rewards_flat_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Stage-3 motor-PD fine-tuning env: same LegacyRewards task, explicit ``IdealPdActuator``.
+
+  Matches deploy / sim2sim ``--ablate-motor-pd-control`` plant dynamics (Python
+  computes ``tau = kp*e_q + kd*e_dq`` on ``<motor>``), unlike the default
+  ``BuiltinPositionActuator`` implicit position PD used in Stage 1/2.
+  """
+  from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+    get_g1_klavier_robot_cfg_ideal_pd,
+  )
+
+  cfg = unitree_g1_depth_klavier_legacy_rewards_stage1_flat_env_cfg(play=play)
+  cfg.scene.entities["robot"] = get_g1_klavier_robot_cfg_ideal_pd()
+  return cfg
+
+
 def unitree_g1_depth_klavier_legacy_rewards_stage1_flat_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
@@ -701,6 +755,21 @@ def unitree_g1_depth_klavier_legacy_rewards_stage1_flat_env_cfg(
     "actuator_gains",
   ):
     cfg.events.pop(event_name, None)
+  cfg.rewards["command_velocity_envelope"] = RewardTermCfg(
+    func=command_velocity_envelope_l2,
+    weight=-1.0,
+    params={
+      "command_name": "twist",
+      "min_tolerance_x": 0.10,
+      "min_tolerance_y": 0.10,
+      "min_tolerance_yaw": 0.15,
+      "relative_tolerance": 0.30,
+    },
+  )
+  cfg.rewards["action_acc_l2"] = RewardTermCfg(
+    func=envs_mdp.action_acc_l2,
+    weight=-0.1,
+  )
   return cfg
 
 
