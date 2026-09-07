@@ -795,6 +795,32 @@ def unitree_g1_klavier_legacy512_motor_pd_legacy_rewards_flat_env_cfg(
   return cfg
 
 
+def unitree_g1_klavier_legacy512_motor_pd_long_dropout10_flat_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """MotorPD BallNoise0 Teacher with 10% long ball-observation loss."""
+  cfg = unitree_g1_klavier_legacy512_motor_pd_legacy_rewards_flat_env_cfg(play=play)
+  command = cfg.commands["twist"]
+  assert isinstance(command, UniformVelocityCommandCfg)
+  command.standing_mode_per_episode = True
+
+  # Sample only from the 95% non-standing episodes so the unconditional share
+  # is 10%. Selected episodes become blind after 2--6 s and stay blind.
+  ball_features = cfg.observations["actor_history"].terms["ball_features_b"]
+  ball_features.params.update(
+    {
+      "transition_dropout_probability": 0.0 if play else 0.10 / 0.95,
+      "transition_dropout_start_range_s": (2.0, 6.0),
+      "transition_dropout_until_end_probability": 0.0 if play else 1.0,
+      "transition_excluded_standing_command_name": "twist",
+      "sensor_reward_fade_out_s": 0.5,
+      "sensor_reward_fade_in_s": 0.5,
+    }
+  )
+  cfg.terminations["ball_out_of_control"].params["ignore_when_sensor_hidden"] = not play
+  return cfg
+
+
 def _align_isaaclab_actor_observation_randomization(
   cfg: ManagerBasedRlEnvCfg,
 ) -> None:

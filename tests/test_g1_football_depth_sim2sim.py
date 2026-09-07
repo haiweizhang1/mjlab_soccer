@@ -76,7 +76,9 @@ def test_training_action_processor_applies_no_clamps() -> None:
 
 
 def test_depth_sim2sim_uses_deployment_command_envelope() -> None:
-  Sim2SimCfg(command_x=1.0, command_y=-0.25, command_yaw=1.0)
+  cfg = Sim2SimCfg(command_x=1.0, command_y=-0.25, command_yaw=1.0)
+  assert cfg.pd_mode == "implicit"
+  assert not cfg.uses_explicit_pd
 
   with pytest.raises(ValueError, match="deployment range"):
     Sim2SimCfg(command_x=1.01)
@@ -84,6 +86,14 @@ def test_depth_sim2sim_uses_deployment_command_envelope() -> None:
     Sim2SimCfg(command_y=-0.26)
   with pytest.raises(ValueError, match="camera_position_jitter_meters"):
     Sim2SimCfg(camera_position_jitter_meters=-0.001)
+
+
+def test_depth_sim2sim_supports_both_pd_modes_and_legacy_alias() -> None:
+  assert Sim2SimCfg(pd_mode="explicit").uses_explicit_pd
+  assert Sim2SimCfg(ablate_motor_pd_control=True).uses_explicit_pd
+
+  with pytest.raises(ValueError, match="at most one parity ablation"):
+    Sim2SimCfg(pd_mode="explicit", ablate_projected_gravity=True)
 
 
 def test_keyboard_controller_can_use_deployment_command_envelope() -> None:

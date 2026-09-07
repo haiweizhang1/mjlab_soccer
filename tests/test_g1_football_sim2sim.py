@@ -54,9 +54,7 @@ def make_session(
     "default_joint_pos": ",".join("0" for _ in range(29)),
     "action_scale": ",".join("0.5" for _ in range(29)),
     "observation_names": ",".join(observation_names),
-    "observation_terms_history_length": ",".join(
-      "5" for _ in observation_names
-    ),
+    "observation_terms_history_length": ",".join("5" for _ in observation_names),
   }
   return SimpleNamespace(
     get_inputs=lambda: [SimpleNamespace(name="obs", shape=[1, input_dim])],
@@ -282,6 +280,13 @@ def test_sim2sim_defaults_to_robocup_visual_observation() -> None:
 
   assert cfg.ball_observer == "robocup"
   assert cfg.yolo_confidence is None
+  assert cfg.pd_mode == "implicit"
+  assert not cfg.uses_explicit_pd
+
+
+def test_sim2sim_supports_clear_and_legacy_explicit_pd_switches() -> None:
+  assert Sim2SimCfg(pd_mode="explicit").uses_explicit_pd
+  assert Sim2SimCfg(ablate_motor_pd_control=True).uses_explicit_pd
 
 
 def test_robocup_yolo_preprocess_uses_top_left_black_padding() -> None:
@@ -473,3 +478,10 @@ def test_task_model_contains_policy_joints_ball_and_native_timing() -> None:
   assert model.geom_size[ball_geom_id, 0] == pytest.approx(0.1098)
   assert model.body_mass[ball_body_id] == pytest.approx(0.43)
   np.testing.assert_allclose(model.geom_friction[ball_geom_id], (0.1, 0.005, 0.001))
+
+
+def test_explicit_pd_model_uses_raw_motor_actuators() -> None:
+  model, _, _ = build_model(motor_pd_control=True)
+
+  assert model.nu == EXPECTED_ACTION_DIM
+  assert np.all(model.actuator_biastype != mujoco.mjtBias.mjBIAS_AFFINE)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,6 +17,7 @@ import tyro
 import mjlab
 import mjlab.tasks  # noqa: F401
 from mjlab.scene import Scene
+from mjlab.scripts.sim2sim import motor_pd as motor_pd_utils
 from mjlab.scripts.sim2sim.d435_ball_observer import (
   D435_CAMERA_NAME,
   D435BallObserver,
@@ -426,7 +428,11 @@ class ModelBindings:
 
   @classmethod
   def from_model(
-    cls, model: mujoco.MjModel, joint_names: tuple[str, ...]
+    cls,
+    model: mujoco.MjModel,
+    joint_names: tuple[str, ...],
+    *,
+    motor_pd_control: bool = False,
   ) -> ModelBindings:
     """Resolve model addresses by stable names and fail on missing elements."""
 
@@ -436,13 +442,18 @@ class ModelBindings:
         raise ValueError(f"MuJoCo model is missing required object {name!r}.")
       return obj_id
 
+    def actuator_name(joint_name: str) -> str:
+      if motor_pd_control and joint_name.endswith("_joint"):
+        return joint_name.removesuffix("_joint")
+      return joint_name
+
     joint_ids = np.asarray(
       [require_id(mujoco.mjtObj.mjOBJ_JOINT, f"robot/{name}") for name in joint_names],
       dtype=np.int32,
     )
     actuator_ids = np.asarray(
       [
-        require_id(mujoco.mjtObj.mjOBJ_ACTUATOR, f"robot/{name}")
+        require_id(mujoco.mjtObj.mjOBJ_ACTUATOR, f"robot/{actuator_name(name)}")
         for name in joint_names
       ],
       dtype=np.int32,
@@ -477,16 +488,45 @@ class ModelBindings:
 def build_model(
   d435_cfg: D435Config | None = None,
   task_id: str = TASK_ID,
+  *,
+  motor_pd_control: bool = False,
 ) -> tuple[mujoco.MjModel, float, int]:
   """Compile the nominal football play scene and apply its simulation options."""
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
+  if motor_pd_control:
+    from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+      get_g1_klavier_robot_cfg_motors_only,
+    )
+
+    env_cfg.scene.entities["robot"] = get_g1_klavier_robot_cfg_motors_only()
   scene = Scene(env_cfg.scene, device="cpu")
   add_d435_camera(scene.spec, d435_cfg or D435Config())
   add_football_visual_material(scene.spec)
   model = scene.compile()
   env_cfg.sim.mujoco.apply(model)
   return model, model.opt.timestep, env_cfg.decimation
+
+
+def _apply_joint_targets(
+  model: mujoco.MjModel,
+  data: mujoco.MjData,
+  bindings: ModelBindings,
+  target: FloatArray,
+  *,
+  motor_pd_control: bool,
+  kp_scale: float = 1.0,
+  kd_scale: float = 1.0,
+) -> None:
+  motor_pd_utils.apply_joint_targets(
+    model,
+    data,
+    target,
+    bindings.actuator_ids,
+    motor_pd_control=motor_pd_control,
+    kp_scale=kp_scale,
+    kd_scale=kd_scale,
+  )
 
 
 def find_latest_policy(log_root: Path = Path("logs/rsl_rl")) -> Path:
@@ -642,9 +682,21 @@ def _reset(
   assembler: ObservationAssembler,
   ball_observer: Any,
   step_dt: float,
+  *,
+  motor_pd_control: bool,
+  kp_scale: float = 1.0,
+  kd_scale: float = 1.0,
 ) -> tuple[FloatArray, FloatArray]:
   mujoco.mj_resetDataKeyframe(model, data, bindings.init_key_id)
-  data.ctrl[bindings.actuator_ids] = metadata.default_joint_pos
+  _apply_joint_targets(
+    model,
+    data,
+    bindings,
+    metadata.default_joint_pos,
+    motor_pd_control=motor_pd_control,
+    kp_scale=kp_scale,
+    kd_scale=kd_scale,
+  )
   mujoco.mj_forward(model, data)
   ball_observer.reset()
   action = np.zeros(EXPECTED_ACTION_DIM, dtype=np.float32)
@@ -684,6 +736,18 @@ class Sim2SimCfg:
   ball_hold_time: float = 0.5
   show_detection_window: bool = True
   detection_window_rate: float = 15.0
+  pd_mode: motor_pd_utils.PdMode = "implicit"
+  """Use implicit MuJoCo position PD or explicit deploy-style torque PD."""
+  ablate_motor_pd_control: bool = False
+  """Legacy alias for ``pd_mode="explicit"``."""
+  kp_scale: float = 1.0
+  kd_scale: float = 1.0
+
+  @property
+  def uses_explicit_pd(self) -> bool:
+    return motor_pd_utils.uses_explicit_motor_pd(
+      self.pd_mode, legacy_ablation_flag=self.ablate_motor_pd_control
+    )
 
   def __post_init__(self) -> None:
     command = np.asarray(
@@ -696,10 +760,19 @@ class Sim2SimCfg:
         "Velocity command is outside the trained range: "
         "vx=[-0.5, 2.0], vy=[-0.5, 0.5], yaw=[-1.0, 1.0]."
       )
+    if self.kp_scale <= 0.0 or not math.isfinite(self.kp_scale):
+      raise ValueError(
+        f"kp_scale must be a positive finite number, got {self.kp_scale}"
+      )
+    if self.kd_scale <= 0.0 or not math.isfinite(self.kd_scale):
+      raise ValueError(
+        f"kd_scale must be a positive finite number, got {self.kd_scale}"
+      )
 
 
 def run(cfg: Sim2SimCfg) -> None:
   """Load a policy and execute it in native MuJoCo."""
+  motor_pd_control = cfg.uses_explicit_pd
   policy_path = (cfg.policy or find_latest_policy(cfg.log_root)).resolve()
   if not policy_path.is_file():
     raise FileNotFoundError(f"ONNX policy does not exist: {policy_path}")
@@ -716,9 +789,19 @@ def run(cfg: Sim2SimCfg) -> None:
     max_hold_time=cfg.ball_hold_time,
     vision_mode="robocup" if use_robocup_vision else "deployment_rgbd",
   )
-  model, timestep, decimation = build_model(d435_cfg, cfg.task_id)
+  model, timestep, decimation = build_model(
+    d435_cfg,
+    cfg.task_id,
+    motor_pd_control=motor_pd_control,
+  )
+  if not motor_pd_control:
+    motor_pd_utils.scale_training_position_pd_gains(
+      model, kp_scale=cfg.kp_scale, kd_scale=cfg.kd_scale
+    )
   data = mujoco.MjData(model)
-  bindings = ModelBindings.from_model(model, metadata.joint_names)
+  bindings = ModelBindings.from_model(
+    model, metadata.joint_names, motor_pd_control=motor_pd_control
+  )
   ball_observer = make_ball_observer(
     cfg.ball_observer,
     model,
@@ -744,6 +827,9 @@ def run(cfg: Sim2SimCfg) -> None:
     assembler,
     ball_observer,
     step_dt,
+    motor_pd_control=motor_pd_control,
+    kp_scale=cfg.kp_scale,
+    kd_scale=cfg.kd_scale,
   )
   policy_step = 0
   total_policy_steps = max(0, int(cfg.duration / step_dt))
@@ -782,6 +868,16 @@ def run(cfg: Sim2SimCfg) -> None:
   print(
     f"Football observation: source={cfg.ball_observer}, viewer_camera={cfg.camera_view}"
   )
+  print(
+    "Control: "
+    + (
+      "explicit torque PD (XML motors, SDK-order kp/kd + sensordata feedback)"
+      if motor_pd_control
+      else "implicit MuJoCo position PD (ctrl=target)"
+    )
+  )
+  if cfg.kp_scale != 1.0 or cfg.kd_scale != 1.0:
+    print(f"PD gain scale: kp×{cfg.kp_scale:g}, kd×{cfg.kd_scale:g}")
   if cfg.ball_observer == "robocup":
     print(
       "RoboCup vision parity: top-left black padding, bbox-bottom ground "
@@ -813,6 +909,9 @@ def run(cfg: Sim2SimCfg) -> None:
           assembler,
           ball_observer,
           step_dt,
+          motor_pd_control=motor_pd_control,
+          kp_scale=cfg.kp_scale,
+          kd_scale=cfg.kd_scale,
         )
 
       if (
@@ -834,7 +933,15 @@ def run(cfg: Sim2SimCfg) -> None:
       if not np.all(np.isfinite(action)):
         raise RuntimeError("Policy returned NaN or Inf actions.")
       target = metadata.default_joint_pos + metadata.action_scale * action
-      data.ctrl[bindings.actuator_ids] = target
+      _apply_joint_targets(
+        model,
+        data,
+        bindings,
+        target,
+        motor_pd_control=motor_pd_control,
+        kp_scale=cfg.kp_scale,
+        kd_scale=cfg.kd_scale,
+      )
       for _ in range(decimation):
         mujoco.mj_step(model, data)
         if viewer is not None:

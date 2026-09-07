@@ -27,6 +27,7 @@ import tyro
 import mjlab
 import mjlab.tasks  # noqa: F401
 from mjlab.scene import Scene
+from mjlab.scripts.sim2sim import motor_pd as motor_pd_utils
 from mjlab.scripts.sim2sim.g1_football import (
   EXPECTED_ACTION_DIM,
   FRAME_STACK,
@@ -59,7 +60,43 @@ TASK_ID = DEPTH_CANDIDATE_TASK_ID
 DEPLOYED_COMMAND_MIN = np.asarray([-0.25, -0.25, -1.0], dtype=np.float32)
 DEPLOYED_COMMAND_MAX = np.asarray([1.0, 0.25, 1.0], dtype=np.float32)
 
+DEPLOY_JOINT_IDS_MAP = np.asarray(
+  [
+    0,
+    6,
+    12,
+    1,
+    7,
+    13,
+    2,
+    8,
+    14,
+    3,
+    9,
+    15,
+    22,
+    4,
+    10,
+    16,
+    23,
+    5,
+    11,
+    17,
+    24,
+    18,
+    25,
+    19,
+    26,
+    20,
+    27,
+    21,
+    28,
+  ],
+  dtype=np.int32,
+)
+
 FloatArray = npt.NDArray[np.float32]
+GravitySource = Literal["pelvis", "imu_quat"]
 
 
 @dataclass(frozen=True)
@@ -378,12 +415,17 @@ class ModelBindings:
   joint_limits: FloatArray
   root_body_id: int
   imu_sensor_adr: int
+  imu_quat_sensor_adr: int | None
   depth_camera_id: int
   init_key_id: int
 
   @classmethod
   def from_model(
-    cls, model: mujoco.MjModel, joint_names: tuple[str, ...]
+    cls,
+    model: mujoco.MjModel,
+    joint_names: tuple[str, ...],
+    *,
+    motor_pd_control: bool = False,
   ) -> ModelBindings:
     """Resolve model addresses by stable names and fail on missing elements."""
 
@@ -393,13 +435,18 @@ class ModelBindings:
         raise ValueError(f"MuJoCo model is missing required object {name!r}.")
       return obj_id
 
+    def actuator_name(joint_name: str) -> str:
+      if motor_pd_control and joint_name.endswith("_joint"):
+        return joint_name.removesuffix("_joint")
+      return joint_name
+
     joint_ids = np.asarray(
       [require_id(mujoco.mjtObj.mjOBJ_JOINT, f"robot/{name}") for name in joint_names],
       dtype=np.int32,
     )
     actuator_ids = np.asarray(
       [
-        require_id(mujoco.mjtObj.mjOBJ_ACTUATOR, f"robot/{name}")
+        require_id(mujoco.mjtObj.mjOBJ_ACTUATOR, f"robot/{actuator_name(name)}")
         for name in joint_names
       ],
       dtype=np.int32,
@@ -407,6 +454,12 @@ class ModelBindings:
     imu_sensor_id = require_id(mujoco.mjtObj.mjOBJ_SENSOR, "robot/imu_ang_vel")
     if model.sensor_dim[imu_sensor_id] != 3:
       raise ValueError("robot/imu_ang_vel must be a three-dimensional sensor.")
+    imu_quat_sensor_id = mujoco.mj_name2id(
+      model, mujoco.mjtObj.mjOBJ_SENSOR, "robot/imu_quat"
+    )
+    imu_quat_sensor_adr = (
+      int(model.sensor_adr[imu_quat_sensor_id]) if imu_quat_sensor_id >= 0 else None
+    )
     if not np.all(model.jnt_limited[joint_ids]):
       raise ValueError("Every policy joint must have a finite MuJoCo position limit.")
     return cls(
@@ -416,6 +469,7 @@ class ModelBindings:
       joint_limits=model.jnt_range[joint_ids].astype(np.float32),
       root_body_id=require_id(mujoco.mjtObj.mjOBJ_BODY, "robot/pelvis"),
       imu_sensor_adr=int(model.sensor_adr[imu_sensor_id]),
+      imu_quat_sensor_adr=imu_quat_sensor_adr,
       depth_camera_id=require_id(mujoco.mjtObj.mjOBJ_CAMERA, DEPTH_SENSOR_NAME),
       init_key_id=require_id(mujoco.mjtObj.mjOBJ_KEY, "init_state"),
     )
@@ -532,7 +586,10 @@ def add_depth_obstruction(
 
 
 def build_model(
-  *, task_id: str = TASK_ID, obstruct_depth: bool = False
+  *,
+  task_id: str = TASK_ID,
+  obstruct_depth: bool = False,
+  motor_pd_control: bool = False,
 ) -> tuple[mujoco.MjModel, float, int, CameraSensorCfg]:
   """Compile the football play scene with its depth camera already attached.
 
@@ -540,9 +597,18 @@ def build_model(
   ``g1_football.py``): it is part of ``env_cfg.scene.sensors`` for this task,
   so ``Scene`` inserts it into the MjSpec at the exact pose/fovy/resolution
   training uses, and geom-group filtering can be read back from the same cfg.
+
+  When ``motor_pd_control`` is True, keep the Klavier XML ``<motor>`` actuators
+  and drive them with deploy-style software PD instead of position ``ctrl=target``.
   """
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
+  if motor_pd_control:
+    from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+      get_g1_klavier_robot_cfg_motors_only,
+    )
+
+    env_cfg.scene.entities["robot"] = get_g1_klavier_robot_cfg_motors_only()
   depth_cfg = next(
     (
       sensor
@@ -597,8 +663,19 @@ def _proprio_terms(
   command: FloatArray,
   phase: FloatArray,
   last_action: FloatArray,
+  *,
+  gravity_source: GravitySource = "pelvis",
 ) -> dict[str, FloatArray]:
-  root_quat = data.xquat[bindings.root_body_id]
+  if gravity_source == "imu_quat":
+    if bindings.imu_quat_sensor_adr is None:
+      raise RuntimeError(
+        "projected_gravity ablation requires sensor robot/imu_quat in the model."
+      )
+    root_quat = data.sensordata[
+      bindings.imu_quat_sensor_adr : bindings.imu_quat_sensor_adr + 4
+    ]
+  else:
+    root_quat = data.xquat[bindings.root_body_id]
   gravity = quat_apply_inverse(root_quat, (0.0, 0.0, -1.0))
   joint_pos = data.qpos[bindings.joint_qpos_adr].astype(np.float32)
   joint_vel = data.qvel[bindings.joint_dof_adr].astype(np.float32)
@@ -628,6 +705,50 @@ def _render_depth_frame(
   return depth
 
 
+def _configure_depth_scene_option(
+  depth_cfg: CameraSensorCfg,
+  *,
+  ablate_geom_groups: bool,
+) -> mujoco.MjvOption:
+  scene_option = mujoco.MjvOption()
+  if ablate_geom_groups:
+    scene_option.geomgroup[:] = 1
+  else:
+    scene_option.geomgroup[:] = 0
+    for group in depth_cfg.enabled_geom_groups:
+      scene_option.geomgroup[group] = 1
+  return scene_option
+
+
+def _scale_training_position_pd_gains(
+  model: mujoco.MjModel, *, kp_scale: float, kd_scale: float
+) -> None:
+  motor_pd_utils.scale_training_position_pd_gains(
+    model, kp_scale=kp_scale, kd_scale=kd_scale
+  )
+
+
+def _apply_joint_targets(
+  model: mujoco.MjModel,
+  data: mujoco.MjData,
+  bindings: ModelBindings,
+  target: FloatArray,
+  *,
+  motor_pd_control: bool,
+  kp_scale: float = 1.0,
+  kd_scale: float = 1.0,
+) -> None:
+  motor_pd_utils.apply_joint_targets(
+    model,
+    data,
+    target,
+    bindings.actuator_ids,
+    motor_pd_control=motor_pd_control,
+    kp_scale=kp_scale,
+    kd_scale=kd_scale,
+  )
+
+
 def _reset(
   model: mujoco.MjModel,
   data: mujoco.MjData,
@@ -642,6 +763,11 @@ def _reset(
   depth_latency: DepthLatencyQueue | None,
   action_processor: TrainingActionProcessor,
   camera_position_randomizer: CameraPositionResetRandomizer | None,
+  *,
+  gravity_source: GravitySource,
+  motor_pd_control: bool,
+  kp_scale: float = 1.0,
+  kd_scale: float = 1.0,
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
   if camera_position_randomizer is not None:
     position = camera_position_randomizer.reset()
@@ -650,7 +776,15 @@ def _reset(
       f"[{position[0]:.6f}, {position[1]:.6f}, {position[2]:.6f}]"
     )
   mujoco.mj_resetDataKeyframe(model, data, bindings.init_key_id)
-  data.ctrl[bindings.actuator_ids] = action_processor.reset()
+  _apply_joint_targets(
+    model,
+    data,
+    bindings,
+    action_processor.reset(),
+    motor_pd_control=motor_pd_control,
+    kp_scale=kp_scale,
+    kd_scale=kd_scale,
+  )
   mujoco.mj_forward(model, data)
   action = np.zeros(EXPECTED_ACTION_DIM, dtype=np.float32)
   terms = _proprio_terms(
@@ -660,6 +794,7 @@ def _reset(
     user_command,
     _phase(0, step_dt, user_command),
     action,
+    gravity_source=gravity_source,
   )
   proprio_obs = proprio_assembler.reset(terms)
   depth_raw = _render_depth_frame(
@@ -717,6 +852,24 @@ class Sim2SimCfg:
   """Per-axis translation sampled around calibrated pose on every reset."""
   camera_position_seed: int = 42
   """Seed for reset-time camera-position randomization."""
+  ablate_projected_gravity: bool = False
+  """Use ``robot/imu_quat`` instead of pelvis ``xquat`` for projected_gravity."""
+  ablate_depth_geom_groups: bool = False
+  """Render depth with all geom groups instead of training ``(0, 2, 3)``."""
+  pd_mode: motor_pd_utils.PdMode = "implicit"
+  """Use implicit MuJoCo position PD or explicit deploy-style torque PD."""
+  ablate_motor_pd_control: bool = False
+  """Legacy alias for ``pd_mode="explicit"``."""
+  kp_scale: float = 1.0
+  """Multiply all joint kp/stiffness gains (training position PD or motor PD ablation)."""
+  kd_scale: float = 1.0
+  """Multiply all joint kd/damping gains (training position PD or motor PD ablation)."""
+
+  @property
+  def uses_explicit_pd(self) -> bool:
+    return motor_pd_utils.uses_explicit_motor_pd(
+      self.pd_mode, legacy_ablation_flag=self.ablate_motor_pd_control
+    )
 
   def __post_init__(self) -> None:
     command = np.asarray(
@@ -742,10 +895,30 @@ class Sim2SimCfg:
         "camera_position_jitter_meters must be non-negative, got "
         f"{self.camera_position_jitter_meters}"
       )
+    if self.kp_scale <= 0.0 or not math.isfinite(self.kp_scale):
+      raise ValueError(
+        f"kp_scale must be a positive finite number, got {self.kp_scale}"
+      )
+    if self.kd_scale <= 0.0 or not math.isfinite(self.kd_scale):
+      raise ValueError(
+        f"kd_scale must be a positive finite number, got {self.kd_scale}"
+      )
+    ablations = (
+      int(self.ablate_projected_gravity)
+      + int(self.ablate_depth_geom_groups)
+      + int(self.uses_explicit_pd)
+    )
+    if ablations > 1:
+      raise ValueError(
+        "Enable at most one parity ablation flag at a time for A/B testing "
+        "(ablate_projected_gravity, ablate_depth_geom_groups, "
+        "pd_mode=explicit/ablate_motor_pd_control)."
+      )
 
 
 def run(cfg: Sim2SimCfg) -> None:
   """Load a depth-image policy and execute it in native MuJoCo."""
+  motor_pd_control = cfg.uses_explicit_pd
   policy_path = (
     cfg.policy or find_latest_policy(cfg.log_root, task_id=cfg.task_id)
   ).resolve()
@@ -755,11 +928,22 @@ def run(cfg: Sim2SimCfg) -> None:
   metadata = DepthPolicyMetadata.from_session(session)
 
   model, timestep, decimation, depth_cfg = build_model(
-    task_id=cfg.task_id, obstruct_depth=cfg.obstruct_depth
+    task_id=cfg.task_id,
+    obstruct_depth=cfg.obstruct_depth,
+    motor_pd_control=motor_pd_control,
   )
+  if not motor_pd_control:
+    _scale_training_position_pd_gains(
+      model, kp_scale=cfg.kp_scale, kd_scale=cfg.kd_scale
+    )
   data = mujoco.MjData(model)
-  bindings = ModelBindings.from_model(model, metadata.joint_names)
+  bindings = ModelBindings.from_model(
+    model, metadata.joint_names, motor_pd_control=motor_pd_control
+  )
   action_processor = TrainingActionProcessor(metadata)
+  gravity_source: GravitySource = (
+    "imu_quat" if cfg.ablate_projected_gravity else "pelvis"
+  )
   camera_position_randomizer = (
     CameraPositionResetRandomizer(
       model=model,
@@ -775,10 +959,9 @@ def run(cfg: Sim2SimCfg) -> None:
   )
 
   renderer = mujoco.Renderer(model, height=depth_cfg.height, width=depth_cfg.width)
-  scene_option = mujoco.MjvOption()
-  scene_option.geomgroup[:] = 0
-  for group in depth_cfg.enabled_geom_groups:
-    scene_option.geomgroup[group] = 1
+  scene_option = _configure_depth_scene_option(
+    depth_cfg, ablate_geom_groups=cfg.ablate_depth_geom_groups
+  )
 
   proprio_assembler = ProprioAssembler()
   depth_history = _DepthHistoryBuffer(metadata.depth_history_length)
@@ -814,6 +997,10 @@ def run(cfg: Sim2SimCfg) -> None:
     depth_latency,
     action_processor,
     camera_position_randomizer,
+    gravity_source=gravity_source,
+    motor_pd_control=motor_pd_control,
+    kp_scale=cfg.kp_scale,
+    kd_scale=cfg.kd_scale,
   )
   policy_step = 0
   total_policy_steps = max(0, int(cfg.duration / step_dt))
@@ -866,9 +1053,23 @@ def run(cfg: Sim2SimCfg) -> None:
     f"size={metadata.depth_height}x{metadata.depth_width}, "
     f"range=[{DEPTH_MIN_METERS:.2f}, {DEPTH_MAX_METERS:.2f}] m, "
     f"raw={depth_cfg.height}x{depth_cfg.width}, "
-    f"geom_groups={tuple(depth_cfg.enabled_geom_groups)}"
+    f"geom_groups={'all' if cfg.ablate_depth_geom_groups else tuple(depth_cfg.enabled_geom_groups)}"
+  )
+  print(
+    f"Proprio gravity source: {gravity_source} "
+    f"({'training default' if gravity_source == 'pelvis' else 'deploy-like ablation'})"
+  )
+  print(
+    "Control: "
+    + (
+      "explicit torque PD (XML motors, SDK-order kp/kd + sensordata feedback)"
+      if motor_pd_control
+      else "implicit MuJoCo position PD (ctrl=target)"
+    )
   )
   print("Action processing: training parity (no action clamps)")
+  if cfg.kp_scale != 1.0 or cfg.kd_scale != 1.0:
+    print(f"PD gain scale: kp×{cfg.kp_scale:g}, kd×{cfg.kd_scale:g}")
   if cfg.obstruct_depth:
     print("Depth obstruction: ON (occluder fixed in front of the lens)")
   if depth_latency is not None:
@@ -906,6 +1107,10 @@ def run(cfg: Sim2SimCfg) -> None:
           depth_latency,
           action_processor,
           camera_position_randomizer,
+          gravity_source=gravity_source,
+          motor_pd_control=motor_pd_control,
+          kp_scale=cfg.kp_scale,
+          kd_scale=cfg.kd_scale,
         )
 
       if (
@@ -934,7 +1139,15 @@ def run(cfg: Sim2SimCfg) -> None:
       )[0]
       action = np.asarray(policy_output, dtype=np.float32)[0]
       target = action_processor.process(action)
-      data.ctrl[bindings.actuator_ids] = target
+      _apply_joint_targets(
+        model,
+        data,
+        bindings,
+        target,
+        motor_pd_control=motor_pd_control,
+        kp_scale=cfg.kp_scale,
+        kd_scale=cfg.kd_scale,
+      )
       for _ in range(decimation):
         mujoco.mj_step(model, data)
         if viewer is not None:
@@ -948,6 +1161,7 @@ def run(cfg: Sim2SimCfg) -> None:
         keyboard.command,
         _phase(policy_step, step_dt, keyboard.command),
         action,
+        gravity_source=gravity_source,
       )
       proprio_obs = proprio_assembler.append(terms)
       depth_raw = _render_depth_frame(

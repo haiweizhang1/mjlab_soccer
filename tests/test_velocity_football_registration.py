@@ -9,6 +9,8 @@ from mjlab.tasks.velocity_football.config.g1 import (
   BASE_TASK_ID,
   KLAVIER_LEGACY512_TEACHER_LEGACY_REWARDS_NOISE0_TASK_ID,
   KLAVIER_LEGACY512_TEACHER_LEGACY_REWARDS_NOISE5CM_TASK_ID,
+  KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LEGACY_REWARDS_NOISE0_TASK_ID,
+  KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LONG_DROPOUT10_TASK_ID,
   KLAVIER_LEGACY512_TEACHER_NOISE0_TASK_ID,
   KLAVIER_LEGACY512_TEACHER_NOISE5CM_TASK_ID,
   KLAVIER_LEGACY512_WALK_TASK_ID,
@@ -30,6 +32,8 @@ def test_only_expected_coordinate_football_tasks_are_registered() -> None:
     BASE_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_LEGACY_REWARDS_NOISE0_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_LEGACY_REWARDS_NOISE5CM_TASK_ID,
+    KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LEGACY_REWARDS_NOISE0_TASK_ID,
+    KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LONG_DROPOUT10_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_NOISE0_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_NOISE5CM_TASK_ID,
     KLAVIER_TEACHER_TASK_ID,
@@ -44,6 +48,8 @@ def test_only_expected_coordinate_football_tasks_are_registered() -> None:
     KLAVIER_TEACHER_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_LEGACY_REWARDS_NOISE0_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_LEGACY_REWARDS_NOISE5CM_TASK_ID,
+    KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LEGACY_REWARDS_NOISE0_TASK_ID,
+    KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LONG_DROPOUT10_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_NOISE0_TASK_ID,
     KLAVIER_LEGACY512_TEACHER_NOISE5CM_TASK_ID,
     TEACHER_BASELINE_TASK_ID,
@@ -239,3 +245,34 @@ def test_klavier_legacy512_legacy_rewards_teacher_pair_contract(
   assert "push_velocity_levels" not in cfg.curriculum
   assert runner_cfg.actor.hidden_dims == (512, 256, 128)
   assert runner_cfg.algorithm.symmetry_cfg is None
+
+
+def test_klavier_motor_pd_long_dropout10_resume_contract() -> None:
+  cfg = load_env_cfg(KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LONG_DROPOUT10_TASK_ID)
+  play_cfg = load_env_cfg(
+    KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LONG_DROPOUT10_TASK_ID, play=True
+  )
+  runner_cfg = cast(
+    Any, load_rl_cfg(KLAVIER_LEGACY512_TEACHER_MOTOR_PD_LONG_DROPOUT10_TASK_ID)
+  )
+  ball = cfg.observations["actor_history"].terms["ball_features_b"]
+  play_ball = play_cfg.observations["actor_history"].terms["ball_features_b"]
+
+  assert ball.params["frame_noise_range"] == pytest.approx(0.0)
+  assert ball.params["dropout_probability"] == pytest.approx(0.0)
+  assert ball.params["episode_dropout_probability"] == pytest.approx(0.0)
+  assert ball.params["transition_dropout_probability"] == pytest.approx(0.10 / 0.95)
+  assert ball.params["transition_dropout_start_range_s"] == (2.0, 6.0)
+  assert ball.params["transition_dropout_until_end_probability"] == pytest.approx(1.0)
+  assert ball.params["transition_excluded_standing_command_name"] == "twist"
+  assert ball.params["sensor_reward_fade_out_s"] == pytest.approx(0.5)
+  assert (ball.delay_min_lag, ball.delay_max_lag) == (0, 0)
+  assert cfg.terminations["ball_out_of_control"].params["ignore_when_sensor_hidden"]
+  assert play_ball.params["transition_dropout_probability"] == pytest.approx(0.0)
+  assert not play_cfg.terminations["ball_out_of_control"].params[
+    "ignore_when_sensor_hidden"
+  ]
+  assert runner_cfg.experiment_name == (
+    "g1_velocity_football_klavier_legacy512_motor_pd"
+  )
+  assert runner_cfg.max_iterations == 20_000

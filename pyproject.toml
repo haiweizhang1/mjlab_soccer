@@ -67,6 +67,7 @@ list-envs = "mjlab.scripts.list_envs:main"
 viz-nan = "mjlab.scripts.nan_viz:main"
 export-scene = "mjlab.scripts.export_scene:main"
 sim2sim-g1-football = "mjlab.scripts.sim2sim.g1_football:main"
+sim2sim-g1-football-depth = "mjlab.scripts.sim2sim.g1_football_depth:main"
 
 [dependency-groups]
 dev = [
